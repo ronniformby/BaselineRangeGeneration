@@ -1,4 +1,6 @@
 package com.arcbest.optimization;
 
-public class OptimizationDirection {
+public enum OptimizationDirection {
+    MINIMIZE,
+    MAXIMIZE
 }
