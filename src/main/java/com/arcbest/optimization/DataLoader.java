@@ -23,10 +23,10 @@ public class DataLoader {
                 loadShipments(Path.of(shipmentCsvPath), carriers, transitTimesByShipment);
 
         GlobalParameters globalParameters = new GlobalParameters(
-                3,
+                2,
                 8,
                 0.60,
-                10_000.0
+                2_000.00
         );
 
         return new ModelData(shipments, carriers, globalParameters);

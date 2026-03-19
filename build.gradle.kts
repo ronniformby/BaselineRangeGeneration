@@ -18,7 +18,7 @@ dependencies {
 }
 
 application {
-    mainClass.set("com.arcbest.optimization.RangeGenerationRunner")
+    mainClass.set("com.arcbest.optimization.FullModelRunner")
     applicationDefaultJvmArgs = listOf("--enable-native-access=ALL-UNNAMED")
 }
 

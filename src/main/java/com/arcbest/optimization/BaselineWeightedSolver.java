@@ -5,18 +5,15 @@ import com.google.ortools.linearsolver.MPConstraint;
 import com.google.ortools.linearsolver.MPObjective;
 import com.google.ortools.linearsolver.MPSolver;
 import com.google.ortools.linearsolver.MPVariable;
-
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-public class ObjectiveBoundsSolver {
-    public OptimizationModels.SolveResult solve(
+public class BaselineWeightedSolver {
+    public OptimizationModels.BaselineResult solve(
             ModelData modelData,
-            ObjectiveMetric objectiveMetric,
-            OptimizationDirection direction) {
-
+            OptimizationModels.BaselineWeights weights) {
         Loader.loadNativeLibraries();
 
         MPSolver solver = MPSolver.createSolver("SCIP");
@@ -71,7 +68,7 @@ public class ObjectiveBoundsSolver {
             selectedNeedsShipment.setCoefficient(selectedVar, -1.0);
 
             double maxShipmentsAllowed =
-                    Math.ceil(globalParameters.getDefaultMaxShipmentShare() * shipments.size());
+                    Math.floor(globalParameters.getDefaultMaxShipmentShare() * shipments.size());
 
             MPConstraint maxShipmentsConstraint = solver.makeConstraint(
                     Double.NEGATIVE_INFINITY,
@@ -115,8 +112,31 @@ public class ObjectiveBoundsSolver {
             maxCarriersConstraint.setCoefficient(selectedVar, 1.0);
         }
 
+        Map<String, Double> claimsNorm = buildClaimsNormalization(carriers);
+        Map<String, Double> offTimeNorm = buildOffTimeNormalization(carriers);
+
         MPObjective objective = solver.objective();
-        applyObjective(objective, shipments, carriers, assignmentVars, objectiveMetric, direction);
+        objective.setMinimization();
+
+        for (Shipment shipment : shipments) {
+            Map<String, Double> costNorm = buildShipmentCostNormalization(shipment);
+            Map<String, Double> transitNorm = buildShipmentTransitNormalization(shipment);
+
+            for (ShipmentOption option : shipment.getOptions()) {
+                MPVariable assignmentVar = assignmentVars.get(shipment.getId()).get(option.getCarrierId());
+                if (assignmentVar == null) {
+                    continue;
+                }
+
+                double coefficient =
+                        weights.costWeight() * costNorm.getOrDefault(option.getCarrierId(), 0.0)
+                                + weights.transitWeight() * transitNorm.getOrDefault(option.getCarrierId(), 0.0)
+                                + weights.claimsWeight() * claimsNorm.getOrDefault(option.getCarrierId(), 0.0)
+                                + weights.offTimeWeight() * offTimeNorm.getOrDefault(option.getCarrierId(), 0.0);
+
+                objective.setCoefficient(assignmentVar, coefficient);
+            }
+        }
 
         MPSolver.ResultStatus status = solver.solve();
         if (status != MPSolver.ResultStatus.OPTIMAL && status != MPSolver.ResultStatus.FEASIBLE) {
@@ -126,44 +146,102 @@ public class ObjectiveBoundsSolver {
         List<AssignmentRecord> assignments = extractAssignments(shipments, carriers, assignmentVars);
         KPISnapshot kpiSnapshot = calculateKPIs(assignments);
 
-        return new OptimizationModels.SolveResult(
-                objectiveMetric,
-                direction,
-                objective.value(),
-                kpiSnapshot,
-                assignments
-        );
+        return new OptimizationModels.BaselineResult(objective.value(), kpiSnapshot, assignments);
     }
 
-    private void applyObjective(
-            MPObjective objective,
-            List<Shipment> shipments,
-            Map<String, Carrier> carriers,
-            Map<String, Map<String, MPVariable>> assignmentVars,
-            ObjectiveMetric objectiveMetric,
-            OptimizationDirection direction) {
+    private Map<String, Double> buildClaimsNormalization(Map<String, Carrier> carriers) {
+        double minClaims = Double.POSITIVE_INFINITY;
+        double maxClaims = Double.NEGATIVE_INFINITY;
 
-        if (direction == OptimizationDirection.MINIMIZE) {
-            objective.setMinimization();
-        } else {
-            objective.setMaximization();
+        for (Carrier carrier : carriers.values()) {
+            minClaims = Math.min(minClaims, carrier.getClaimsRate());
+            maxClaims = Math.max(maxClaims, carrier.getClaimsRate());
         }
 
-        for (Shipment shipment : shipments) {
-            for (ShipmentOption option : shipment.getOptions()) {
-                MPVariable assignmentVar = assignmentVars.get(shipment.getId()).get(option.getCarrierId());
-                Carrier carrier = carriers.get(option.getCarrierId());
+        Map<String, Double> claimsNorm = new LinkedHashMap<>();
+        for (Carrier carrier : carriers.values()) {
+            claimsNorm.put(
+                    carrier.getId(),
+                    normalizeLowerBetter(carrier.getClaimsRate(), minClaims, maxClaims));
+        }
 
-                double coefficient = switch (objectiveMetric) {
-                    case COST -> option.getCost();
-                    case TRANSIT_TIME -> option.getTransitTime();
-                    case CLAIMS -> carrier.getClaimsRate();
-                    case OFF_TIME_DELIVERY -> carrier.getOffTimeDeliveryRate();
-                };
+        return claimsNorm;
+    }
 
-                objective.setCoefficient(assignmentVar, coefficient);
+    private Map<String, Double> buildOffTimeNormalization(Map<String, Carrier> carriers) {
+        double minOffTime = Double.POSITIVE_INFINITY;
+        double maxOffTime = Double.NEGATIVE_INFINITY;
+
+        for (Carrier carrier : carriers.values()) {
+            minOffTime = Math.min(minOffTime, carrier.getOffTimeDeliveryRate());
+            maxOffTime = Math.max(maxOffTime, carrier.getOffTimeDeliveryRate());
+        }
+
+        Map<String, Double> offTimeNorm = new LinkedHashMap<>();
+        for (Carrier carrier : carriers.values()) {
+            offTimeNorm.put(
+                    carrier.getId(),
+                    normalizeLowerBetter(carrier.getOffTimeDeliveryRate(), minOffTime, maxOffTime));
+        }
+
+        return offTimeNorm;
+    }
+
+    private Map<String, Double> buildShipmentCostNormalization(Shipment shipment) {
+        double minCost = Double.POSITIVE_INFINITY;
+        double maxCost = Double.NEGATIVE_INFINITY;
+
+        for (ShipmentOption option : shipment.getOptions()) {
+            if (!option.isFeasible()) {
+                continue;
             }
+            minCost = Math.min(minCost, option.getCost());
+            maxCost = Math.max(maxCost, option.getCost());
         }
+
+        Map<String, Double> costNorm = new LinkedHashMap<>();
+        for (ShipmentOption option : shipment.getOptions()) {
+            if (!option.isFeasible()) {
+                continue;
+            }
+            costNorm.put(
+                    option.getCarrierId(),
+                    normalizeLowerBetter(option.getCost(), minCost, maxCost));
+        }
+
+        return costNorm;
+    }
+
+    private Map<String, Double> buildShipmentTransitNormalization(Shipment shipment) {
+        double minTransit = Double.POSITIVE_INFINITY;
+        double maxTransit = Double.NEGATIVE_INFINITY;
+
+        for (ShipmentOption option : shipment.getOptions()) {
+            if (!option.isFeasible()) {
+                continue;
+            }
+            minTransit = Math.min(minTransit, option.getTransitTime());
+            maxTransit = Math.max(maxTransit, option.getTransitTime());
+        }
+
+        Map<String, Double> transitNorm = new LinkedHashMap<>();
+        for (ShipmentOption option : shipment.getOptions()) {
+            if (!option.isFeasible()) {
+                continue;
+            }
+            transitNorm.put(
+                    option.getCarrierId(),
+                    normalizeLowerBetter(option.getTransitTime(), minTransit, maxTransit));
+        }
+
+        return transitNorm;
+    }
+
+    private double normalizeLowerBetter(double value, double minValue, double maxValue) {
+        if (Double.compare(minValue, maxValue) == 0) {
+            return 0.0;
+        }
+        return (value - minValue) / (maxValue - minValue);
     }
 
     private List<AssignmentRecord> extractAssignments(

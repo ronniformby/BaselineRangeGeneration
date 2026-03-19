@@ -5,17 +5,30 @@ import com.google.ortools.linearsolver.MPConstraint;
 import com.google.ortools.linearsolver.MPObjective;
 import com.google.ortools.linearsolver.MPSolver;
 import com.google.ortools.linearsolver.MPVariable;
-
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-public class ObjectiveBoundsSolver {
-    public OptimizationModels.SolveResult solve(
+public class EpsilonRelaxationSolver {
+    public OptimizationModels.EpsilonResult solve(
             ModelData modelData,
-            ObjectiveMetric objectiveMetric,
-            OptimizationDirection direction) {
+            OptimizationModels.BaselineResult baselineResults,
+            OptimizationModels.KPIRanges kpiRanges,
+            OptimizationModels.EpsilonRequest request) {
+
+        OptimizationModels.EpsilonValues epsilonValues = OptimizationModels.EpsilonValues.fromRanges(
+                kpiRanges,
+                request.relaxationPercent()
+        );
+
+        if (request.targetObjective() != ObjectiveMetric.TRANSIT_TIME) {
+            throw new UnsupportedOperationException(
+                    "Current epsilon relaxation implementation is set up for TRANSIT_TIME as the target objective.");
+        }
+
+        Map<String, String> baselineAssignmentByShipment = toAssignmentMap(baselineResults);
 
         Loader.loadNativeLibraries();
 
@@ -115,53 +128,114 @@ public class ObjectiveBoundsSolver {
             maxCarriersConstraint.setCoefficient(selectedVar, 1.0);
         }
 
+        addBaselineRelaxationConstraints(
+                solver,
+                shipments,
+                carriers,
+                assignmentVars,
+                baselineResults,
+                baselineAssignmentByShipment,
+                epsilonValues,
+                request
+        );
+
         MPObjective objective = solver.objective();
-        applyObjective(objective, shipments, carriers, assignmentVars, objectiveMetric, direction);
+        objective.setMinimization();
+        for (Shipment shipment : shipments) {
+            for (ShipmentOption option : shipment.getOptions()) {
+                MPVariable assignmentVar = assignmentVars.get(shipment.getId()).get(option.getCarrierId());
+                if (assignmentVar != null) {
+                    objective.setCoefficient(assignmentVar, option.getTransitTime());
+                }
+            }
+        }
 
         MPSolver.ResultStatus status = solver.solve();
         if (status != MPSolver.ResultStatus.OPTIMAL && status != MPSolver.ResultStatus.FEASIBLE) {
-            throw new IllegalStateException("No feasible solution found. Solver status: " + status);
+            throw new IllegalStateException("No feasible epsilon-relaxation solution found. Solver status: " + status);
         }
 
         List<AssignmentRecord> assignments = extractAssignments(shipments, carriers, assignmentVars);
-        KPISnapshot kpiSnapshot = calculateKPIs(assignments);
+        KPISnapshot kpis = calculateKPIs(assignments);
+        double shipmentChangeShare = calculateShipmentChangeShare(assignments, baselineAssignmentByShipment);
+        double relativeImprovement = calculateRelativeImprovement(
+                baselineResults.kpis().getAverageTransitTime(),
+                kpis.getAverageTransitTime()
+        );
 
-        return new OptimizationModels.SolveResult(
-                objectiveMetric,
-                direction,
-                objective.value(),
-                kpiSnapshot,
+        return new OptimizationModels.EpsilonResult(
+                request.targetObjective(),
+                kpis.getAverageTransitTime(),
+                kpis,
+                epsilonValues,
+                shipmentChangeShare,
+                relativeImprovement,
                 assignments
         );
     }
 
-    private void applyObjective(
-            MPObjective objective,
+    private void addBaselineRelaxationConstraints(
+            MPSolver solver,
             List<Shipment> shipments,
             Map<String, Carrier> carriers,
             Map<String, Map<String, MPVariable>> assignmentVars,
-            ObjectiveMetric objectiveMetric,
-            OptimizationDirection direction) {
+            OptimizationModels.BaselineResult baselineResults,
+            Map<String, String> baselineAssignmentByShipment,
+            OptimizationModels.EpsilonValues epsilonValues,
+            OptimizationModels.EpsilonRequest request) {
 
-        if (direction == OptimizationDirection.MINIMIZE) {
-            objective.setMinimization();
-        } else {
-            objective.setMaximization();
-        }
+        int shipmentCount = shipments.size();
+
+        MPConstraint costConstraint = solver.makeConstraint(
+                Double.NEGATIVE_INFINITY,
+                baselineResults.kpis().getTotalCost() + epsilonValues.costEpsilon(),
+                "baseline_cost_epsilon");
+
+        MPConstraint claimsConstraint = solver.makeConstraint(
+                Double.NEGATIVE_INFINITY,
+                baselineResults.kpis().getAverageClaims() + epsilonValues.claimsEpsilon(),
+                "baseline_claims_epsilon");
+
+        MPConstraint offTimeConstraint = solver.makeConstraint(
+                Double.NEGATIVE_INFINITY,
+                baselineResults.kpis().getAverageOffTimeDelivery() + epsilonValues.offTimeEpsilon(),
+                "baseline_offtime_epsilon");
+
+        double maxSameAssignments = shipmentCount * (1.0 - request.minimumShipmentChangeShare());
+        MPConstraint shipmentChangeConstraint = solver.makeConstraint(
+                Double.NEGATIVE_INFINITY,
+                maxSameAssignments,
+                "minimum_shipment_change_share");
+
+        double maxAverageTransit =
+                baselineResults.kpis().getAverageTransitTime() * (1.0 - request.minimumRelativeImprovement());
+        MPConstraint improvementConstraint = solver.makeConstraint(
+                Double.NEGATIVE_INFINITY,
+                maxAverageTransit,
+                "minimum_relative_improvement");
 
         for (Shipment shipment : shipments) {
+            String baselineCarrierId = baselineAssignmentByShipment.get(shipment.getId());
+            if (baselineCarrierId == null) {
+                throw new IllegalArgumentException(
+                        "Missing baseline assignment for shipment " + shipment.getId());
+            }
+
             for (ShipmentOption option : shipment.getOptions()) {
                 MPVariable assignmentVar = assignmentVars.get(shipment.getId()).get(option.getCarrierId());
+                if (assignmentVar == null) {
+                    continue;
+                }
+
                 Carrier carrier = carriers.get(option.getCarrierId());
+                costConstraint.setCoefficient(assignmentVar, option.getCost());
+                claimsConstraint.setCoefficient(assignmentVar, carrier.getClaimsRate() / shipmentCount);
+                offTimeConstraint.setCoefficient(assignmentVar, carrier.getOffTimeDeliveryRate() / shipmentCount);
+                improvementConstraint.setCoefficient(assignmentVar, option.getTransitTime() / shipmentCount);
 
-                double coefficient = switch (objectiveMetric) {
-                    case COST -> option.getCost();
-                    case TRANSIT_TIME -> option.getTransitTime();
-                    case CLAIMS -> carrier.getClaimsRate();
-                    case OFF_TIME_DELIVERY -> carrier.getOffTimeDeliveryRate();
-                };
-
-                objective.setCoefficient(assignmentVar, coefficient);
+                if (option.getCarrierId().equals(baselineCarrierId)) {
+                    shipmentChangeConstraint.setCoefficient(assignmentVar, 1.0);
+                }
             }
         }
     }
@@ -208,7 +282,6 @@ public class ObjectiveBoundsSolver {
         }
 
         int count = assignments.size();
-
         double averageTransitTime = count == 0 ? 0.0 : totalTransitTime / count;
         double averageClaims = count == 0 ? 0.0 : totalClaims / count;
         double averageOffTimeDelivery = count == 0 ? 0.0 : totalOffTimeDelivery / count;
@@ -219,6 +292,36 @@ public class ObjectiveBoundsSolver {
                 averageClaims,
                 averageOffTimeDelivery
         );
+    }
+
+    private double calculateShipmentChangeShare(
+            List<AssignmentRecord> assignments,
+            Map<String, String> baselineAssignmentByShipment) {
+        int changedCount = 0;
+
+        for (AssignmentRecord assignment : assignments) {
+            String baselineCarrierId = baselineAssignmentByShipment.get(assignment.getShipmentId());
+            if (!assignment.getCarrierId().equals(baselineCarrierId)) {
+                changedCount++;
+            }
+        }
+
+        return assignments.isEmpty() ? 0.0 : (double) changedCount / assignments.size();
+    }
+
+    private double calculateRelativeImprovement(double baselineTransitAverage, double newTransitAverage) {
+        if (baselineTransitAverage == 0.0) {
+            return 0.0;
+        }
+        return (baselineTransitAverage - newTransitAverage) / baselineTransitAverage;
+    }
+
+    private Map<String, String> toAssignmentMap(OptimizationModels.BaselineResult baselineResults) {
+        Map<String, String> assignmentMap = new HashMap<>();
+        for (AssignmentRecord assignment : baselineResults.assignments()) {
+            assignmentMap.put(assignment.getShipmentId(), assignment.getCarrierId());
+        }
+        return assignmentMap;
     }
 
     private ShipmentOption findOption(Shipment shipment, String carrierId) {
